@@ -1,0 +1,5 @@
+# dsh-lib-analyzer bundle layer: library absorption analysis tools
+# (libscan / libtasks / libreport / libsearch) + the library-analysis skill.
+- insert:
+    - id: lib-analyzer
+      name: '@snow-the/dsh-lib-analyzer'
