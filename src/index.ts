@@ -27,7 +27,46 @@
 import { readdir, readFile, writeFile, mkdir, stat } from 'node:fs/promises';
 import { join, relative, resolve, sep, dirname, basename } from 'node:path';
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { Hono } from 'hono';
+
+// --- ACP graph compatibility (data-layer dependency on dsh-session-handoff) ---
+let DatabaseSync: any = null;
+try { ({ DatabaseSync } = (await import('node:sqlite')) as any); } catch { /* old node */ }
+function acpGraphPath(): string {
+  return join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'graph', 'graph.db');
+}
+/** ACP 图可用性：graph.db 存在 且 docs 表有数据（说明已索引外部知识）。 */
+function acpDocsAvailable(): boolean {
+  try {
+    if (!DatabaseSync || !existsSync(acpGraphPath())) return false;
+    const db = new DatabaseSync(acpGraphPath(), { readOnly: true });
+    try {
+      const row = db.prepare('SELECT COUNT(*) AS c FROM docs').get() as { c: number };
+      return (row?.c ?? 0) > 0;
+    } finally { db.close(); }
+  } catch { return false; }
+}
+/** 查 ACP 图 doc_fts 索引（libsearch 复用）。 */
+function acpDocSearch(query: string, limit: number, kind: string | null): { file: string; line: number; context: string }[] {
+  try {
+    const db = new DatabaseSync(acpGraphPath(), { readOnly: true });
+    try {
+      const matchQ = JSON.stringify(query) + '*';
+      const out: { file: string; line: number; context: string }[] = [];
+      const sql = kind
+        ? 'SELECT d.source, d.title, d.body FROM doc_fts JOIN docs d ON d.id = doc_fts.id WHERE doc_fts MATCH ? AND d.kind = ? ORDER BY bm25(doc_fts) LIMIT ?'
+        : 'SELECT d.source, d.title, d.body FROM doc_fts JOIN docs d ON d.id = doc_fts.id WHERE doc_fts MATCH ? ORDER BY bm25(doc_fts) LIMIT ?';
+      const args = kind ? [matchQ, kind, limit] : [matchQ, limit];
+      const rows = db.prepare(sql).all(...args) as { source: string; title: string; body: string }[];
+      for (const r of rows) {
+        const firstLine = r.body.split(/\r?\n/).find((l) => l.toLowerCase().includes(query.toLowerCase())) ?? r.body.slice(0, 160);
+        out.push({ file: r.title, line: 1, context: firstLine.trim().slice(0, 160) });
+      }
+      return out;
+    } finally { db.close(); }
+  } catch { return []; }
+}
 
 export const name = 'lib-analyzer';
 export const inject = ['tools'];
@@ -413,6 +452,17 @@ const searchTool: Tool = {
     const needle = q.toLowerCase();
     const hits: { file: string; line: number; context: string }[] = [];
     const limit = num(args, 'limit', 20);
+    const scopeArg = String((args as Record<string, Json>)?.scope ?? 'all');
+    const kindFilter = scopeArg === 'pages' ? 'page' : scopeArg === 'reports' ? 'report' : null;
+
+    // 兼容依赖：ACP 图已索引外部知识时，复用 ACP doc_fts 索引（不再逐行扫描）
+    if (acpDocsAvailable()) {
+      const acpHits = acpDocSearch(q, limit, kindFilter);
+      if (acpHits.length) {
+        return { ok: true, query: q, scope: scopeArg, root: store, source: 'acp_graph', count: acpHits.length, hits: acpHits.slice(0, limit) };
+      }
+    }
+    // 降级：ACP 不可用或无命中 → 回退本地逐行扫描
 
     const index: { pages: Record<string, Json>; reports: Record<string, Json> } = { pages: {}, reports: {} };
     try {
