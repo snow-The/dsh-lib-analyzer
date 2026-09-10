@@ -2,6 +2,7 @@
 import { readdir, readFile, writeFile, mkdir, stat } from "node:fs/promises";
 import { join, relative, resolve, sep, dirname, basename } from "node:path";
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 
 // node_modules/.pnpm/hono@4.13.3/node_modules/hono/dist/compose.js
 var compose = (middleware, onError, onNotFound) => {
@@ -2081,6 +2082,54 @@ var Hono2 = class extends Hono {
 };
 
 // src/index.ts
+var DatabaseSync = null;
+try {
+  ({ DatabaseSync } = await import("node:sqlite"));
+} catch {
+}
+function acpGraphPath() {
+  return join(process.env.DSH_HOME ?? join(homedir(), ".dsh"), "graph", "graph.db");
+}
+function acpDocsAvailable() {
+  try {
+    if (!DatabaseSync || !existsSync(acpGraphPath())) return false;
+    const db = new DatabaseSync(acpGraphPath(), { readOnly: true });
+    try {
+      const row = db.prepare("SELECT COUNT(*) AS c FROM docs").get();
+      return (row?.c ?? 0) > 0;
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    warn("ACP docs probe failed", err);
+    return false;
+  }
+}
+function acpDocSearch(query, limit, kind) {
+  try {
+    const db = new DatabaseSync(acpGraphPath(), { readOnly: true });
+    try {
+      const matchQ = JSON.stringify(query) + "*";
+      const out = [];
+      const sql = kind ? "SELECT d.source, d.title, d.body FROM doc_fts JOIN docs d ON d.id = doc_fts.id WHERE doc_fts MATCH ? AND d.kind = ? ORDER BY bm25(doc_fts) LIMIT ?" : "SELECT d.source, d.title, d.body FROM doc_fts JOIN docs d ON d.id = doc_fts.id WHERE doc_fts MATCH ? ORDER BY bm25(doc_fts) LIMIT ?";
+      const args = kind ? [matchQ, kind, limit] : [matchQ, limit];
+      const rows = db.prepare(sql).all(...args);
+      for (const r of rows) {
+        const firstLine = r.body.split(/\r?\n/).find((l) => l.toLowerCase().includes(query.toLowerCase())) ?? r.body.slice(0, 160);
+        out.push({ file: r.title, line: 1, context: firstLine.trim().slice(0, 160) });
+      }
+      return out;
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    warn("ACP index lookup failed", err);
+    return [];
+  }
+}
+function warn(what, err) {
+  console.warn("[dsh-lib-analyzer] " + what + ":", err instanceof Error ? err.message : String(err));
+}
 var name = "lib-analyzer";
 var inject = ["tools"];
 var STORE_DIR = ".dsh-lib-analyzer";
@@ -2456,6 +2505,14 @@ var searchTool = {
     const needle = q.toLowerCase();
     const hits = [];
     const limit = num(args, "limit", 20);
+    const scopeArg = String(args?.scope ?? "all");
+    const kindFilter = scopeArg === "pages" ? "page" : scopeArg === "reports" ? "report" : null;
+    if (acpDocsAvailable()) {
+      const acpHits = acpDocSearch(q, limit, kindFilter);
+      if (acpHits.length) {
+        return { ok: true, query: q, scope: scopeArg, root: store, source: "acp_graph", count: acpHits.length, hits: acpHits.slice(0, limit) };
+      }
+    }
     const index = { pages: {}, reports: {} };
     try {
       Object.assign(index, JSON.parse(await readFile(join(store, "index.json"), "utf8")));

@@ -45,7 +45,7 @@ function acpDocsAvailable(): boolean {
       const row = db.prepare('SELECT COUNT(*) AS c FROM docs').get() as { c: number };
       return (row?.c ?? 0) > 0;
     } finally { db.close(); }
-  } catch { return false; }
+  } catch (err) { warn('ACP docs probe failed', err); return false; }
 }
 /** 查 ACP 图 doc_fts 索引（libsearch 复用）。 */
 function acpDocSearch(query: string, limit: number, kind: string | null): { file: string; line: number; context: string }[] {
@@ -65,7 +65,16 @@ function acpDocSearch(query: string, limit: number, kind: string | null): { file
       }
       return out;
     } finally { db.close(); }
-  } catch { return []; }
+  } catch (err) { warn('ACP index lookup failed', err); return []; }
+}
+
+/**
+ * A fallback keeps working when the ACP graph is unavailable (by design), but it must
+ * never be indistinguishable from "the graph is simply empty" - that is how a silent
+ * week-long outage happened elsewhere in this stack. Only the error path logs.
+ */
+function warn(what: string, err: unknown): void {
+  console.warn('[dsh-lib-analyzer] ' + what + ':', err instanceof Error ? err.message : String(err));
 }
 
 export const name = 'lib-analyzer';
