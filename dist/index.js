@@ -2082,6 +2082,10 @@ var Hono2 = class extends Hono {
 };
 
 // src/index.ts
+function ftsPhrase(q) {
+  const toks = String(q ?? "").toLowerCase().replace(/["'^*:()\[\]{}]/g, " ").split(/\s+/).filter((t) => t.length > 1).slice(0, 8);
+  return toks.length ? toks.map((t) => '"' + t + '"').join(" OR ") : '""';
+}
 var DatabaseSync = null;
 try {
   ({ DatabaseSync } = await import("node:sqlite"));
@@ -2109,7 +2113,7 @@ function acpDocSearch(query, limit, kind) {
   try {
     const db = new DatabaseSync(acpGraphPath(), { readOnly: true });
     try {
-      const matchQ = JSON.stringify(query) + "*";
+      const matchQ = ftsPhrase(query);
       const out = [];
       const sql = kind ? "SELECT d.source, d.title, d.body FROM doc_fts JOIN docs d ON d.id = doc_fts.id WHERE doc_fts MATCH ? AND d.kind = ? ORDER BY bm25(doc_fts) LIMIT ?" : "SELECT d.source, d.title, d.body FROM doc_fts JOIN docs d ON d.id = doc_fts.id WHERE doc_fts MATCH ? ORDER BY bm25(doc_fts) LIMIT ?";
       const args = kind ? [matchQ, kind, limit] : [matchQ, limit];
