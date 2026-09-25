@@ -402,7 +402,7 @@ const reportTool: Tool = {
       '',
       '## 可吸收设计',
       '',
-      (designs ?? '(报告缺少「可吸收设计」节)').slice(0, 2000),
+      (designs ?? '(报告缺少「可吸收设计」节)').slice(0, 2000).toWellFormed(),
       '',
       '## 证据索引',
       '',

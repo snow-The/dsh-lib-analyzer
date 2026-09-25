@@ -2447,7 +2447,7 @@ var reportTool = {
       "",
       "## \u53EF\u5438\u6536\u8BBE\u8BA1",
       "",
-      (designs ?? "(\u62A5\u544A\u7F3A\u5C11\u300C\u53EF\u5438\u6536\u8BBE\u8BA1\u300D\u8282)").slice(0, 2e3),
+      (designs ?? "(\u62A5\u544A\u7F3A\u5C11\u300C\u53EF\u5438\u6536\u8BBE\u8BA1\u300D\u8282)").slice(0, 2e3).toWellFormed(),
       "",
       "## \u8BC1\u636E\u7D22\u5F15",
       "",
