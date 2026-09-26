@@ -1,5 +1,5 @@
 /**
- * dsh-lib-analyzer — library absorption analysis for DeepSeek Harness (TypeScript + Hono).
+ * dsh-lib-analyzer — library absorption analysis for DeepSeek Harness (TypeScript).
  *
  * Tools:
  *   libscan   — scan a reference-corpus directory (ref/) into a bounded structure
@@ -14,8 +14,8 @@
  *               and update <root>/.dsh-lib-analyzer/index.json.
  *   libsearch — keyword search across knowledge pages and produced reports.
  *
- * HTTP (Hono): createHonoApp(ctx) exposes /api/analyzer/health; the plugin tries
- * to mount on the host http service, same pattern as dsh-codex.
+ * HTTP: registerHttpRoutes(ctx, register) exposes /api/analyzer/health on the
+ * official ctx.webServer (native node:http req/res — no Hono, no bridge).
  *
  * Design rules:
  *  1. node builtins only; no child processes, no network.
@@ -27,61 +27,100 @@
 import { readdir, readFile, writeFile, mkdir, stat } from 'node:fs/promises';
 import { join, relative, resolve, sep, dirname, basename } from 'node:path';
 import { existsSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { Hono } from 'hono';
-
-/** FTS5 phrase builder: quotes every token so user text (paths like C:\\x, "*", ":", quotes)
- * can never be parsed as column filters or operators. Falls back to a harmless empty phrase. */
-function ftsPhrase(q: unknown): string {
-  const toks = String(q ?? '').toLowerCase().replace(/["'^*:()\[\]{}]/g, ' ').split(/\s+/).filter((t) => t.length > 1).slice(0, 8);
-  return toks.length ? toks.map((t) => '"' + t + '"*').join(' OR ') : '""';
-}
+import type { IncomingMessage, ServerResponse } from 'node:http';
 
 // --- ACP graph compatibility (data-layer dependency on dsh-session-handoff) ---
-let DatabaseSync: any = null;
-try { ({ DatabaseSync } = (await import('node:sqlite')) as any); } catch { /* old node */ }
-function acpGraphPath(): string {
-  return join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'graph', 'graph.db');
+//
+// 读取经【规范化只读契约】（见 src/acp-graph-contract.ts，由 dsh-acp-graph-contract 同步
+// 而来，顶部带源哈希，漂移会被 --check 抓到），不再裸 SQLite + 硬编码路径 + "失败即
+// 返回 []"。旧实现里"库没建"、"docs 表是空的"、"schema 变了"三种情况在调用方看来完全
+// 一样——契约把它们变成具名的 Result。
+//
+// 契约当前的覆盖边界（不要误读为漏改）：ACP_GRAPH_V1_REQUIRED 只声明
+// checkpoints / checkpoint_nodes / nodes / cp_fts / node_fts；docs / doc_fts 由生产者
+// 建表但【尚未进契约】。所以本插件用契约做"可读性判定"（版本戳不高于本读取器 + v1 形状
+// 齐全），而 docs 查询本身仍是本插件自己的 SQL —— 契约暂未提供 docs 的查询入口。
+import {
+  acpGraphOr,
+  acpGraphStatus,
+  ftsPhrase,
+  type AcpGraphStatus,
+} from './acp-graph-contract.js';
+
+/** 最近一次读取失败的原因（供诊断输出）；成功时为 null。 */
+let lastAcpProblem: { detail: string; status: AcpGraphStatus } | null = null;
+
+/**
+ * 记录失败原因。
+ *
+ * 只有 'no-db' 不打日志：图不存在是【预期内的降级】（本插件不依赖 handoff 也要能用），
+ * 公开状态由 acpGraphStatusLine() 表达。其余原因都是真故障，必须出声。无论是否打日志，
+ * 原因都进 lastAcpProblem，诊断永远完整。
+ */
+function note(detail: string, status: AcpGraphStatus): void {
+  lastAcpProblem = { detail, status };
+  if (status.reason === 'no-db') return;
+  console.warn('[dsh-lib-analyzer] ACP graph read failed:', detail, `(reason=${status.reason})`);
 }
-/** ACP 图可用性：graph.db 存在 且 docs 表有数据（说明已索引外部知识）。 */
-function acpDocsAvailable(): boolean {
-  try {
-    if (!DatabaseSync || !existsSync(acpGraphPath())) return false;
-    const db = new DatabaseSync(acpGraphPath(), { readOnly: true });
-    try {
-      const row = db.prepare('SELECT COUNT(*) AS c FROM docs').get() as { c: number };
-      return (row?.c ?? 0) > 0;
-    } finally { db.close(); }
-  } catch (err) { warn('ACP docs probe failed', err); return false; }
-}
-/** 查 ACP 图 doc_fts 索引（libsearch 复用）。 */
-function acpDocSearch(query: string, limit: number, kind: string | null): { file: string; line: number; context: string }[] {
-  try {
-    const db = new DatabaseSync(acpGraphPath(), { readOnly: true });
-    try {
-      const matchQ = ftsPhrase(query);
-      const out: { file: string; line: number; context: string }[] = [];
-      const sql = kind
-        ? 'SELECT d.source, d.title, d.body FROM doc_fts JOIN docs d ON d.id = doc_fts.id WHERE doc_fts MATCH ? AND d.kind = ? ORDER BY bm25(doc_fts) LIMIT ?'
-        : 'SELECT d.source, d.title, d.body FROM doc_fts JOIN docs d ON d.id = doc_fts.id WHERE doc_fts MATCH ? ORDER BY bm25(doc_fts) LIMIT ?';
-      const args = kind ? [matchQ, kind, limit] : [matchQ, limit];
-      const rows = db.prepare(sql).all(...args) as { source: string; title: string; body: string }[];
-      for (const r of rows) {
-        const firstLine = r.body.split(/\r?\n/).find((l) => l.toLowerCase().includes(query.toLowerCase())) ?? r.body.slice(0, 160);
-        out.push({ file: r.title, line: 1, context: firstLine.trim().slice(0, 160) });
-      }
-      return out;
-    } finally { db.close(); }
-  } catch (err) { warn('ACP index lookup failed', err); return []; }
+
+/** 诊断用：契约状态 + 最近一次失败原因。 */
+export function acpGraphDiagnostics(): { status: AcpGraphStatus; lastProblem: { detail: string; status: AcpGraphStatus } | null } {
+  return { status: acpGraphStatus(), lastProblem: lastAcpProblem };
 }
 
 /**
- * A fallback keeps working when the ACP graph is unavailable (by design), but it must
- * never be indistinguishable from "the graph is simply empty" - that is how a silent
- * week-long outage happened elsewhere in this stack. Only the error path logs.
+ * 一行人类可读的状态，用于工具输出。刻意区分"没装"与"装了但读不了"——
+ * 图不可用时一律说"install dsh-session-handoff"会把人引向错误的方向。
  */
-function warn(what: string, err: unknown): void {
-  console.warn('[dsh-lib-analyzer] ' + what + ':', err instanceof Error ? err.message : String(err));
+export function acpGraphStatusLine(): string {
+  const s = acpGraphStatus();
+  switch (s.reason) {
+    case 'ok':
+      return `available (contract v${s.contractVersion}, db v${s.stampedVersion})`;
+    case 'no-contract':
+      return `available (db has no version stamp; shape verified against contract v${s.contractVersion})`;
+    case 'no-db':
+      return `not available — ${s.path} does not exist (is dsh-session-handoff installed?)`;
+    case 'schema-mismatch':
+      return `NOT readable — ${s.detail}${s.missing ? ' missing: ' + JSON.stringify(s.missing) : ''}`;
+    default:
+      return `NOT readable — ${s.detail ?? 'unknown error'}`;
+  }
+}
+
+/**
+ * 契约是否【可读】——与数据量无关（"库健康但空"过去会被报成不可用，是误导）。
+ * 注意这不是"docs 有内容"；那个问题由 acpDocsAvailable() 回答。
+ */
+export function acpGraphAvailable(): boolean {
+  return acpGraphStatus().ok;
+}
+
+/** ACP 图的外部知识索引(docs)是否可用：契约可读 且 docs 表确有数据。 */
+function acpDocsAvailable(): boolean {
+  // 数据量判定必须留在数据层：契约给的是"能不能读"，不是"有没有内容"。
+  return acpGraphOr(false, (db) => {
+    const row = db.prepare('SELECT COUNT(*) AS c FROM docs').get() as { c: number };
+    return (row?.c ?? 0) > 0;
+  }, note);
+}
+
+/** 查 ACP 图 doc_fts 索引（libsearch 复用）。契约不可读时返回 [] 并记录具名原因。 */
+function acpDocSearch(query: string, limit: number, kind: string | null): { file: string; line: number; context: string }[] {
+  return acpGraphOr([], (db) => {
+    const matchQ = ftsPhrase(query);
+    const out: { file: string; line: number; context: string }[] = [];
+    const sql = kind
+      ? 'SELECT d.source, d.title, d.body FROM doc_fts JOIN docs d ON d.id = doc_fts.id WHERE doc_fts MATCH ? AND d.kind = ? ORDER BY bm25(doc_fts) LIMIT ?'
+      : 'SELECT d.source, d.title, d.body FROM doc_fts JOIN docs d ON d.id = doc_fts.id WHERE doc_fts MATCH ? ORDER BY bm25(doc_fts) LIMIT ?';
+    const args = kind ? [matchQ, kind, limit] : [matchQ, limit];
+    const rows = db.prepare(sql).all(...args) as { source: string; title: string; body: string }[];
+    for (const r of rows) {
+      const firstLine = r.body.split(/\r?\n/).find((l) => l.toLowerCase().includes(query.toLowerCase())) ?? r.body.slice(0, 160);
+      out.push({ file: r.title, line: 1, context: firstLine.trim().slice(0, 160) });
+    }
+    return out;
+  }, note);
 }
 
 export const name = 'lib-analyzer';
@@ -104,8 +143,24 @@ interface Tool {
   execute: (args: Json, exec: { signal?: AbortSignal }) => Promise<Json>
 }
 
+/** Official web-server surface (host/webserver/src/index.ts:42-47, 166). */
+interface WebServer {
+  register: (route: {
+    kind: 'exact' | 'prefix'
+    path: string
+    handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+  }) => () => void
+}
+
+/** The child context handed to the ctx.inject callback — here webServer is legal to read. */
+interface InjectedCtx {
+  webServer: WebServer
+  effect?: (fn: () => unknown, label?: string) => unknown
+}
+
 interface Ctx {
   tools: { register: (tool: Tool) => void }
+  inject?: (deps: string[], cb: (ctx: InjectedCtx) => unknown) => unknown
 }
 
 const STORE_DIR = '.dsh-lib-analyzer';
@@ -531,16 +586,112 @@ const searchTool: Tool = {
   },
 };
 
-// --- Hono app factory (same pattern as dsh-codex) ---
+// --- HTTP route (official ctx.webServer; native node:http req/res, no Hono, no bridge) ---
 
-export interface AppEnv {
-  Bindings: { ctx: unknown }
+/**
+ * 原先这里返回一个 Hono app 供 `ctx.http?.mount?.()` 挂载, 而 `ctx.http` 不是 DSH 的
+ * 服务(官方 90 个 ctx.* 里没有它), 所以路由从未响应过任何请求, `hono` 依赖却一直背着。
+ * 官方 web 层本来就是 node:http, handler 拿的是原生 IncomingMessage/ServerResponse,
+ * 官方既不依赖 hono 也没有 Node↔Fetch 桥 —— 所以这里直接写 res, 不造桥、不引 hono。
+ */
+/**
+ * Apply the official Host/Origin + browser-auth fence to one plugin's health routes.
+ *
+ * SOURCE — copied from the official DSH 0.1.7-rc.2 package `@deepseek-ai/dsh-host-open-in-app`,
+ * which states the contract in its own module comment
+ * (`lib/types/index.js:1-21`): "Security has one home, here. **Every route** asks the
+ * composition's `connection` service for a rejection first (`requestRejection`): its Host/Origin
+ * fence defeats DNS rebinding and cross-site calls, and its browser authentication (the
+ * login-token cookie) gates every caller". The helper shape is `lib/index.js:1263-1270` and its
+ * use is the first line of every handler there (`lib/index.js:1274-1275`).
+ *
+ * `requestRejection` itself (`dsh-client-connection/lib/index.js:586-589`):
+ *   403 -> the Host is not loopback/trusted, or `sec-fetch-site: cross-site`, or Origin != Host
+ *   401 -> the fence passed but there is no valid login-token cookie
+ * so an anonymous request gets 401 and a forged one gets 403. Authentication accepts the
+ * `dsh-auth-*` cookie ONLY (minted by the 303 set-cookie on `GET /?token=...`); the boot token
+ * itself does not authenticate an API call. A browser that loaded the page first is unaffected.
+ *
+ * DO NOT "simplify" this away, and do not replace the read with `Reflect.get(ctx, 'connection')`.
+ * The official helper is written that way because its own plugin declares `inject: ['connection']`;
+ * from a plugin that does not, MEASURED on a live 127.0.0.1 instance, BOTH
+ * `ctx.connection` AND `Reflect.get(ctx, 'connection')` throw
+ * `cannot get property "connection" without inject` (cordis's proxy get-trap throws before any
+ * optional chaining can help), while `ctx.get('connection')` returned the live
+ * `HostConnectionService` with `requestRejection` present. `ctx.get` is also the official
+ * inject-free service read — `dsh-web-app/lib/index.js:216` gates the ready banner on
+ * `connectionCtx.get("connection") !== void 0`.
+ *
+ * FAIL-CLOSED. When the service is unreachable the request is answered 503, never forwarded:
+ * silently serving would reopen exactly the hole this helper exists to close. In this profile
+ * the branch is unreachable by construction — the route only registers under
+ * `ctx.inject(['webServer'])`, and every composition that has `webServer` also carries
+ * `connection` (`dsh-web-app/cordis.patch.yml:210-217` registers it beside the webserver).
+ *
+ * Each plugin carries its OWN copy on purpose: they are independent packages, and a shared
+ * module would create a new deployment coupling (the ACP-graph contract already showed what
+ * that costs, with 5 copies to re-sync on every edit).
+ */
+
+/** Just enough of the official HostConnectionService for the fence call. */
+interface RequestFenceConnection {
+  /** @returns 401/403 when the request must be refused, `undefined` when it may proceed. */
+  requestRejection: (request: IncomingMessage) => number | undefined
 }
 
-export function createHonoApp(_ctx: unknown): Hono<AppEnv> {
-  const app = new Hono<AppEnv>();
-  app.get('/api/analyzer/health', (c) => c.json({ ok: true, plugin: 'dsh-lib-analyzer', ts: true, hono: true }));
-  return app;
+/**
+ * Build the fence for one plugin life.
+ *
+ * @param ctx - the plugin's context; only `get` is used, and only at call time.
+ * @returns true when the request was answered by the fence and the handler must stop.
+ */
+function createRequestFence(ctx: unknown): (req: IncomingMessage, res: ServerResponse) => boolean {
+  /** Read the service without declaring `inject` — see the read note above for why not Reflect.get. */
+  const resolveConnection = (): RequestFenceConnection | undefined => {
+    const read = (ctx as { get?: (name: string) => unknown } | null | undefined)?.get
+    if (typeof read !== 'function') return undefined
+    try {
+      const connection = read.call(ctx, 'connection') as RequestFenceConnection | undefined
+      return typeof connection?.requestRejection === 'function' ? connection : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  return (req, res) => {
+    const connection = resolveConnection()
+    if (connection === undefined) {
+      // Fail closed: an unreachable fence must not become an open route.
+      res.statusCode = 503
+      res.setHeader('content-type', 'application/json; charset=utf-8')
+      res.end(JSON.stringify({ error: 'connection service unavailable: the Host/Origin fence cannot be applied' }))
+      return true
+    }
+    const rejection = connection.requestRejection(req)
+    if (rejection === undefined) return false
+    res.statusCode = rejection
+    res.end()
+    return true
+  }
+}
+
+export function registerHttpRoutes(
+  ctx: unknown,
+  register: (kind: 'exact' | 'prefix', path: string, handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>) => void,
+): void {
+  const rejected = createRequestFence(ctx)
+  register('exact', '/api/analyzer/health', (req, res) => {
+    if (rejected(req, res)) return
+    if (req.method !== 'GET') {
+      res.statusCode = 405;
+      res.setHeader('allow', 'GET');
+      res.end();
+      return;
+    }
+    res.statusCode = 200;
+    res.setHeader('content-type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify({ ok: true, plugin: 'dsh-lib-analyzer', ts: true }));
+  });
 }
 
 export function apply(ctx: Ctx): void {
@@ -552,11 +703,20 @@ export function apply(ctx: Ctx): void {
     }
   }
 
-  // Hono app: try to mount on the host http service when available.
-  try {
-    const http = (ctx as unknown as { http?: { mount?: (p: string, f: unknown) => void } }).http;
-    if (http?.mount) http.mount('/analyzer', createHonoApp(ctx).fetch);
-  } catch {
-    /* no host http service */
-  }
+  // HTTP: 注册到官方 ctx.webServer。
+  //
+  // **不能**直接读 `ctx.webServer` —— cordis 的 ctx 是代理, 读一个已注册但未声明 inject
+  // 的服务会抛 "cannot get property ... without inject", 可选链挡不住(get 陷阱先抛)。
+  // 官方写法是用 ctx.inject 把依赖收进子 context (client/connection/src/index.ts:139-159):
+  //   ctx.inject(['webServer'], (webCtx) => webCtx.effect(() => webCtx.webServer.register(route), 'label'))
+  // 没有 webServer 的 profile 里回调不执行 —— 路由不注册, 插件其余部分照常加载。
+  // (原先的 `ctx.http?.mount?.()` —— ctx.http 不是 DSH 服务, 那条路由从未生效。)
+  ctx.inject?.(['webServer'], (webCtx) => {
+    const register = (kind: 'exact' | 'prefix', path: string, handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>): void => {
+      webCtx.webServer.register({ kind, path, handler });
+    };
+    const mount = (): void => registerHttpRoutes(ctx, register);
+    if (typeof webCtx.effect === 'function') webCtx.effect(mount, 'lib-analyzer: GET /api/analyzer/health');
+    else mount();
+  });
 }
