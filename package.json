@@ -23,6 +23,13 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dshReleases": [
+        "0.2.0-rc.1",
+        "0.2.0-rc.2"
+      ],
+      "verifiedAgainst": "0.2.0-rc.2"
     }
   },
   "types": "./dist/index.d.ts",
@@ -35,5 +42,8 @@
     "build": "tsc -p tsconfig.json --emitDeclarationOnly && esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:@deepseek-ai/* --log-level=warning",
     "test": "node --test",
     "fuzz": "node test/fuzz-libscan.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0-rc.1"
   }
 }
