@@ -661,7 +661,7 @@ function apply(ctx) {
     try {
       ctx.tools.register(tool);
     } catch (err) {
-      console.error(`[lib-analyzer] ${tool.name} skipped: ${err}`);
+      console.error(`[dsh-lib-analyzer] ${tool.name} skipped: ${err}`);
     }
   }
   ctx.inject?.(["webServer"], (webCtx) => {
