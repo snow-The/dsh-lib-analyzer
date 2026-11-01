@@ -26,12 +26,9 @@
     },
     "compatibility": {
       "dshReleases": [
-        "0.2.0-rc.1",
-        "0.2.0-rc.2",
-        "0.2.1-rc.2",
-        "0.2.1-rc.3"
+        "0.2.1-rc.5"
       ],
-      "verifiedAgainst": "0.2.1-rc.3"
+      "verifiedAgainst": "0.2.1-rc.5"
     }
   },
   "types": "./dist/index.d.ts",
@@ -46,9 +43,9 @@
     "fuzz": "node test/fuzz-libscan.mjs"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh": ">=0.2.0-rc.1"
+    "@deepseek-ai/dsh": ">=0.2.1-rc.5"
   },
   "engines": {
-    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
+    "dsh": ">=0.2.1-rc.5"
   }
 }
