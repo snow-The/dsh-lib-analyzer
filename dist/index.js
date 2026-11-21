@@ -2,6 +2,11 @@
 import { readdir, readFile, writeFile, mkdir, stat } from "node:fs/promises";
 import { join as join2, relative, resolve, sep, dirname, basename } from "node:path";
 import { existsSync as existsSync2 } from "node:fs";
+// HAND-PATCHED 2026-11-12: esbuild/tsc 的平台 optional 套件不在磁碟上，無法重打包。
+// 這一版 dist 是手動把 src/index.ts 的同一個改動（skill provider）補進來的；
+// 下次能跑 `pnpm install && pnpm run build` 時，重打包會覆蓋這幾行（內容等價）。
+import { fileURLToPath } from "node:url";
+import { apply as applyFilesystemSkillProvider } from "@deepseek-ai/dsh-skill-filesystem";
 
 // src/acp-graph-contract.ts
 import { DatabaseSync } from "node:sqlite";
@@ -187,7 +192,8 @@ function acpDocSearch(query, limit, kind) {
   }, note);
 }
 var name = "lib-analyzer";
-var inject = ["tools"];
+var inject = ["tools", "skills"];
+var skillsRoot = fileURLToPath(new URL("../skills/", import.meta.url));
 var STORE_DIR = ".dsh-lib-analyzer";
 var BIG_FILE_BYTES = 1024 * 1024;
 var SKIP_DIRS = /* @__PURE__ */ new Set([
@@ -657,6 +663,16 @@ function registerHttpRoutes(ctx, register) {
   });
 }
 function apply(ctx) {
+  try {
+    applyFilesystemSkillProvider(ctx, {
+      providerName: "lib-analyzer",
+      includeDefaultRoots: false,
+      bundledSkillDir: skillsRoot,
+      watch: false
+    });
+  } catch (err) {
+    console.error(`[dsh-lib-analyzer] skill provider skipped: ${err}`);
+  }
   for (const tool of [scanTool, tasksTool, reportTool, searchTool]) {
     try {
       ctx.tools.register(tool);

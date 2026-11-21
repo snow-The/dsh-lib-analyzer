@@ -27,6 +27,8 @@
 import { readdir, readFile, writeFile, mkdir, stat } from 'node:fs/promises';
 import { join, relative, resolve, sep, dirname, basename } from 'node:path';
 import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { apply as applyFilesystemSkillProvider } from '@deepseek-ai/dsh-skill-filesystem';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 // --- ACP graph compatibility (data-layer dependency on dsh-session-handoff) ---
@@ -124,7 +126,12 @@ function acpDocSearch(query: string, limit: number, kind: string | null): { file
 }
 
 export const name = 'lib-analyzer';
-export const inject = ['tools'];
+// 'skills' 是 2026-11-12 補的：四支工具在，但使用協議只寫在 skills/library-analysis/SKILL.md，
+// 沒有 provider 就永遠不進 catalog（等於「工具落地、方法沒落地」）。
+export const inject = ['tools', 'skills'];
+
+// 吸收方法的 skill：與 dsh-skill-pack 同一個官方 provider（dist/index.js:423 的 bundledSkillDir 寫法）。
+const skillsRoot = fileURLToPath(new URL('../skills/', import.meta.url));
 
 // --- minimal DSH tool surface ---
 type Json = null | boolean | number | string | Json[] | { [k: string]: Json | undefined }
@@ -695,6 +702,20 @@ export function registerHttpRoutes(
 }
 
 export function apply(ctx: Ctx): void {
+  // Skill provider 先掛：它與四支工具互不依賴，失敗也不該擋住工具面。
+  // ctx 是本地最小介面（Ctx），官方 provider 吃的是 cordis Context —— 執行期同一個物件，
+  // 這裡只用型別轉換，不改行為。
+  try {
+    applyFilesystemSkillProvider(ctx as unknown as Parameters<typeof applyFilesystemSkillProvider>[0], {
+      providerName: 'lib-analyzer',
+      includeDefaultRoots: false,   // 只供自己的 skills/，不要重掃 ~/.agents（那是別人的 provider 的責任）
+      bundledSkillDir: skillsRoot,
+      watch: false,
+    });
+  } catch (err) {
+    console.error(`[dsh-lib-analyzer] skill provider skipped: ${err}`);
+  }
+
   for (const tool of [scanTool, tasksTool, reportTool, searchTool]) {
     try {
       ctx.tools.register(tool);
