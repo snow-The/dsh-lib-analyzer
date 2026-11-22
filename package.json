@@ -1,6 +1,10 @@
 {
   "name": "@snow-the/dsh-lib-analyzer",
   "version": "0.1.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/snow-The/dsh-lib-analyzer.git"
+  },
   "description": "Library absorption analysis for DeepSeek Harness: scan reference corpora (ref/), drive absorption-report task batches (tasks.jsonl → out/*.md), validate report discipline (evidence file:line, ✓◐✗ comparison, 提取方式), and maintain a searchable per-library knowledge base (.dsh-lib-analyzer/pages) — hindsight-style knowledge pages driven by auditable reports instead of conversation recall.",
   "type": "module",
   "main": "./dist/index.js",
